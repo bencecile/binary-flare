@@ -10,6 +10,8 @@ use file_utils;
 
 use stream::{ReadStream};
 
+type InMemoryStream = ReadStream<Cursor<Vec<u8>>>;
+
 //Notes taken from kirikiri XP3Archive.cpp
 /*
 XP3 header mark contains:
@@ -93,17 +95,12 @@ XP3 header mark contains:
     // Check the first flag for continuation (flag & 0x80) == 0 to stop
 // Sort all of the items
 
+
 //Header: XP3\r\n \x1a\x8b\x67\x01
 static HEADER: [u8; 11] = [
     0x58, 0x50, 0x33, 0x0d, 0x0a, 0x20, 0x0a, 0x1a,
     0x8b, 0x67, 0x01,
 ];
-
-//Chunk Names
-static FILE_CHUNK: [u8; 4] = [0x46, 0x69, 0x6c, 0x65]; //"File"
-static INFO_CHUNK: [u8; 4] = [0x69, 0x6e, 0x66, 0x6f]; //"info"
-static SEGM_CHUNK: [u8; 4] = [0x73, 0x65, 0x67, 0x6d]; //"segm"
-static ADLR_CHUNK: [u8; 4] = [0x61, 0x64, 0x6c, 0x72]; //"adlr"
 
 //If 1, uses zLib compression, if 0 then raw, error if anything else
 const ENCODING_MASK: u8 = 0x07;
@@ -132,121 +129,13 @@ pub fn flare<R, P>(stream: &mut ReadStream<R>, folder: &P) -> Vec<String>
     loop {
         let (mut entry_data, entry_flag) = find_entry_data(stream, start_offset);
 
-        let mut file_start: usize = 0;
-        let mut file_size: usize = entry_data.len() as usize;
         loop {
-            if !find_chunk(&mut entry_data, FILE_CHUNK, &mut file_start, &mut file_size) {
+            //Keep going while we are finding file chunks
+            if let Some(Chunk::File(ref mut file_data)) = find_chunk(&mut entry_data) {
+                items.push(ArchiveItem::new(file_data, start_offset));
+            } else {
                 break;
             }
-
-            let mut info_start = file_start;
-            let mut info_size = file_size;
-            if !find_chunk(&mut entry_data, INFO_CHUNK, &mut info_start, &mut info_size) {
-                panic!("Couldn't find the info chunk after the File chunk at 0x{:x}", file_start);
-            }
-
-            let mut item = ArchiveItem {
-                name: String::new(),
-                file_hash: 0,
-                original_size: 0,
-                archive_size: 0,
-                segments: Vec::new(),
-            };
-            let item_flags = entry_data.read_u32().unwrap();
-            if item_flags & PROTECTED_MASK == 1 {
-                eprintln!("The current index is protected at 0x{:x}", info_start);
-            }
-
-            item.original_size = entry_data.read_u64().unwrap();
-            item.archive_size = entry_data.read_u64().unwrap();
-
-            //Read the UTF-16 name
-            let utf16_len = entry_data.read_u16().unwrap();
-            item.name = entry_data.read_utf16(utf16_len as usize).unwrap();
-            //We need to shorten the path name if it's longer than 255
-            if item.name.len() > 255 {
-                //Find all of the character boundaries
-                let mut first_split_index = 0;
-                let mut second_split_index = 0;
-                let mut bounds: Vec<usize> = Vec::new();
-                for i in 0..item.name.len() {
-                    if item.name.is_char_boundary(i) {
-                        //We need to get the reference the last boundary index so that we have less
-                        // than or equal to 126 characters in the first and second splits
-                        if i > 126 && first_split_index == 0 {
-                            first_split_index = bounds.len() - 1;
-                        }
-                        if i > (item.name.len() - 126) && second_split_index == 0 {
-                            second_split_index = bounds.len() - 1;
-                        }
-                        bounds.push(i);
-                    }
-                }
-
-                //Split it at 126 from the start and 126 from the end so that we can put "..."
-                // in the middle
-                let mut new_name = String::from(&item.name[..bounds[first_split_index]]);
-                new_name.push_str(&"...");
-                new_name.push_str(&item.name[bounds[second_split_index]..]);
-
-                item.name = new_name;
-            }
-
-            let mut segm_start = file_start;
-            let mut segm_size = file_size;
-            if !find_chunk(&mut entry_data, SEGM_CHUNK, &mut segm_start, &mut segm_size) {
-                panic!("Couldn't find the SEGM chunk after the info chunk at 0x{:x}", info_start);
-            }
-
-            if segm_size % 28 != 0 {
-                eprintln!("The segment isn't divisable by 28 bytes at 0x{:x}", info_start);
-            }
-            let count = segm_size / 28;
-            let mut offset_in_archive: u64 = 0;
-            for i in 0..count {
-                let mut seg = ArchiveSegment {
-                    start: 0,
-                    offset: 0,
-                    original_size: 0,
-                    archive_size: 0,
-                    compressed: true,
-                };
-
-                let flags = entry_data.read_u32().unwrap();
-
-                if flags & (ENCODING_MASK as u32) == 1 {
-                    seg.compressed = true;
-                } else if flags & (ENCODING_MASK as u32) == 0 {
-                    seg.compressed = false;
-                } else {
-                    panic!("Bad flag in segment {} at 0x{:x}", i, i * 28 + segm_start);
-                }
-
-                seg.start = entry_data.read_u64().unwrap() + start_offset;
-                seg.offset = offset_in_archive;
-                seg.original_size = entry_data.read_u64().unwrap();
-                seg.archive_size = entry_data.read_u64().unwrap();
-
-                offset_in_archive += seg.original_size;
-
-                item.segments.push(seg);
-            }
-
-            //Sort all of the segments so that the offset of the first segment always starts at 0
-            item.segments.sort();
-
-            let mut adlr_start = file_start;
-            let mut adlr_size = file_size;
-            if !find_chunk(&mut entry_data, ADLR_CHUNK, &mut adlr_start, &mut adlr_size) {
-                panic!("Couldn't find the ADLR chunk after the file start at 0x{:x}", file_start);
-            }
-
-            item.file_hash = entry_data.read_u32().unwrap();
-
-            items.push(item);
-
-            file_start += file_size;
-            file_size = (entry_data.len() as usize) - file_start;
         }
 
         if entry_flag & CONTINUE_MASK == 0 {
@@ -255,10 +144,7 @@ pub fn flare<R, P>(stream: &mut ReadStream<R>, folder: &P) -> Vec<String>
     }
 
     items.sort();
-    println!("{}", items.len());
-    for i in items.iter().take(1) {
-        println!("{:?}", i);
-    }
+    println!("Completed an archive with {} files", items.len());
 
     let mut files: Vec<String> = Vec::new();
     //Write all of the files from the items
@@ -333,7 +219,7 @@ fn find_start_offset<R>(stream: &mut ReadStream<R>) -> Option<u64>
 ///Finds and returns the next entry data with the associated entry flag
 ///This function assumes that the stream is at the start of an entry
 fn find_entry_data<R>(stream: &mut ReadStream<R>, start_offset: u64)
- -> (ReadStream<Cursor<Vec<u8>>>, u8)
+ -> (InMemoryStream, u8)
  where R: Read + Seek {
     //The entry offset may be required to overflow if the header is not at the beginning of a file
     let entry_offset = stream.read_u64().unwrap().wrapping_add(start_offset);
@@ -361,33 +247,21 @@ fn find_entry_data<R>(stream: &mut ReadStream<R>, start_offset: u64)
     (ReadStream::new(Cursor::new(entry_data), true), entry_flag)
 }
 
-fn find_chunk<R>(stream: &mut ReadStream<R>, name: [u8; 4], start: &mut usize, size: &mut usize) -> bool
+///Returns the next chunk type with the stream positioned to start reading its data
+fn find_chunk<R>(stream: &mut ReadStream<R>) -> Option<Chunk>
  where R: Read + Seek {
-    let start_save = *start;
-	let size_save = *size;
+    //Read the name of the chunk
+    let name = match stream.read(4) {
+        Ok(x) => x,
+        Err(_) => return None,
+    };
+    let real_size = match stream.read_u64() {
+        Ok(x) => x,
+        Err(_) => return None,
+    };
+    //The old, original algorithm gives up if real_size uses more than 32 bits
 
-	let mut pos: usize = 0;
-	while pos < *size {
-        let found = *stream.read(4).unwrap() == name;
-		*start += 4;
-        let real_size = stream.read_u64().unwrap();
-		*start += 8;
-		if (u32::max_value() as u64) < real_size {
-			eprintln!("Chunk size is larger than 32 bits");
-            return false;
-        }
-		if found {
-			*size = real_size as usize;
-			return true;
-		}
-		*start += real_size as usize;
-		pos += (real_size as usize) + 4 + 8;
-        stream.seek(SeekFrom::Start(*start as u64));
-	}
-
-	*start = start_save;
-	*size = size_save;
-	false
+    Chunk::guess(stream, [name[0], name[1], name[2], name[3]], real_size)
 }
 
 #[derive(Debug)]
@@ -397,6 +271,90 @@ struct ArchiveItem {
     original_size: u64,
     archive_size: u64,
     segments: Vec<ArchiveSegment>,
+}
+
+impl ArchiveItem {
+    fn new<R>(file_data: &mut ReadStream<R>, start_offset: u64) -> ArchiveItem
+     where R: Read + Seek {
+        let mut item = ArchiveItem {
+            name: String::new(),
+            file_hash: 0,
+            original_size: 0,
+            archive_size: 0,
+            segments: Vec::new(),
+        };
+        
+        //We have a max of 3 sub-chunks that can be found
+        for i in 0..3 {
+            if let Some(mut chunk) = find_chunk(file_data) {
+                match chunk {
+                    Chunk::Info(ref mut info_data) => {
+                        item.read_info(info_data);
+                    },
+                    Chunk::Segment(ref mut segm_data) => {
+                        item.segments.append(
+                            &mut ArchiveSegment::find_all(segm_data, start_offset)
+                        );
+
+                        //Sort all of the segments so that the offset of the first segment always starts at 0
+                        item.segments.sort();
+                    },
+                    Chunk::Adlr(ref mut adlr_data) => {
+                        item.file_hash = adlr_data.read_u32().unwrap();
+                    },
+                    Chunk::File(_) => panic!("A file chunk cannot be within another file chunk"),
+                }
+            } else {
+                //Just break if we get None and move onto the next
+                break;
+            }    
+        }
+
+        item
+    }
+
+    fn read_info<R>(&mut self, info_data: &mut ReadStream<R>)
+     where R: Read + Seek {
+        let item_flags = info_data.read_u32().unwrap();
+        if item_flags & PROTECTED_MASK == 1 {
+            eprintln!("The current index is protected");
+        }
+
+        self.original_size = info_data.read_u64().unwrap();
+        self.archive_size = info_data.read_u64().unwrap();
+
+        //Read the UTF-16 name
+        let utf16_len = info_data.read_u16().unwrap();
+        self.name = info_data.read_utf16(utf16_len as usize).unwrap();
+        //We need to shorten the path name if it's longer than 255 bytes
+        if self.name.len() > 255 {
+            //Find all of the character boundaries
+            let mut first_split_index = 0;
+            let mut second_split_index = 0;
+            let mut bounds: Vec<usize> = Vec::new();
+            for i in 0..self.name.len() {
+                if self.name.is_char_boundary(i) {
+                    //We need to get the reference the last boundary index so that we have less
+                    // than or equal to 126 characters in the first and second splits
+                    if i > 126 && first_split_index == 0 {
+                        first_split_index = bounds.len() - 1;
+                    }
+                    if i > (self.name.len() - 126) && second_split_index == 0 {
+                        second_split_index = bounds.len() - 1;
+                    }
+                    bounds.push(i);
+                }
+            }
+
+            //Create slices that go from the beginning up to the 126th byte, then the last 126 bytes
+            // after adding an elipsis
+            let mut new_name = String::from(&self.name[..bounds[first_split_index]]);
+            new_name.push_str(&"...");
+            new_name.push_str(&self.name[bounds[second_split_index]..]);
+
+            self.name = new_name;
+        }
+    }
 }
 
 impl Ord for ArchiveItem {
@@ -429,6 +387,50 @@ struct ArchiveSegment {
 	compressed: bool,
 }
 
+impl ArchiveSegment {
+    fn find_all<R>(segm_data: &mut ReadStream<R>, start_offset: u64) -> Vec<ArchiveSegment>
+     where R: Read + Seek {
+        let mut segments: Vec<ArchiveSegment> = Vec::new();
+        
+        let segm_size = segm_data.len();
+        if segm_size % 28 != 0 {
+            eprintln!("The segment isn't divisable by 28 bytes");
+        }
+        let count = segm_size / 28;
+        let mut offset_in_archive: u64 = 0;
+        for i in 0..count {
+            let mut seg = ArchiveSegment {
+                start: 0,
+                offset: 0,
+                original_size: 0,
+                archive_size: 0,
+                compressed: true,
+            };
+
+            let flags = segm_data.read_u32().unwrap();
+
+            if flags & (ENCODING_MASK as u32) == 1 {
+                seg.compressed = true;
+            } else if flags & (ENCODING_MASK as u32) == 0 {
+                seg.compressed = false;
+            } else {
+                panic!("Bad flag in segment {}", i);
+            }
+
+            seg.start = segm_data.read_u64().unwrap() + start_offset;
+            seg.offset = offset_in_archive;
+            seg.original_size = segm_data.read_u64().unwrap();
+            seg.archive_size = segm_data.read_u64().unwrap();
+
+            offset_in_archive += seg.original_size;
+
+            segments.push(seg);
+        }
+
+        segments
+    }
+}
+
 impl Ord for ArchiveSegment {
     fn cmp(&self, other: &ArchiveSegment) -> Ordering {
         self.offset.cmp(&other.offset)
@@ -449,9 +451,49 @@ impl PartialEq for ArchiveSegment {
 
 impl Eq for ArchiveSegment {}
 
+//Chunk Names
+const FILE_CHUNK: [u8; 4] = [0x46, 0x69, 0x6c, 0x65]; //"File"
+const INFO_CHUNK: [u8; 4] = [0x69, 0x6e, 0x66, 0x6f]; //"info"
+const SEGM_CHUNK: [u8; 4] = [0x73, 0x65, 0x67, 0x6d]; //"segm"
+const ADLR_CHUNK: [u8; 4] = [0x61, 0x64, 0x6c, 0x72]; //"adlr"
+
 enum Chunk {
-    File,
-    Info,
-    Segment,
-    Adlr,
+    File(InMemoryStream),
+    Info(InMemoryStream),
+    Segment(InMemoryStream),
+    Adlr(InMemoryStream),
+}
+
+impl Chunk {
+    //Tries to guess the type of the chunk
+    fn guess<R>(stream: &mut ReadStream<R>, name: [u8; 4], size: u64) -> Option<Chunk>
+     where R: Read + Seek {
+        //Try to create the stream first as the order for this doesn't matter and doing this first
+        // makes the code cleaner
+        //If either the name checking or the stream fails, we need to return None, anyway
+        if let Some(x) = create_stream(stream, size) {
+            if name == FILE_CHUNK {
+                return Some(Chunk::File(x));
+            } else if name == INFO_CHUNK {
+                return Some(Chunk::Info(x));
+            } else if name == SEGM_CHUNK {
+                return Some(Chunk::Segment(x));
+            } else if name == ADLR_CHUNK {
+                return Some(Chunk::Adlr(x));
+            }
+        }
+        
+        None
+    }
+}
+
+///Creates a stream from the given stream from the next size bytes
+fn create_stream<R>(stream: &mut ReadStream<R>, size: u64) -> Option<InMemoryStream>
+ where R: Read + Seek {
+    let buffer = match stream.read(size as usize) {
+        Ok(x) => x,
+        Err(_) => return None,
+    };
+
+    Some(ReadStream::new(Cursor::new(buffer), true))
 }
