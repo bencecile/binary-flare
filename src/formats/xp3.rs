@@ -1,14 +1,14 @@
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
-use std::fs::{File};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::mem;
+use std::io::{Cursor, SeekFrom};
+use std::io::prelude::*;
+use std::path::{PathBuf};
 
-use flate2::{Decompress, Flush};
+use flate2::write::{ZlibDecoder};
 
+
+use super::{Converter};
 use file_utils;
-
-use stream::{ReadStream};
+use stream::{ReadStream, UTF16LE};
 
 type InMemoryStream = ReadStream<Cursor<Vec<u8>>>;
 
@@ -96,12 +96,6 @@ XP3 header mark contains:
 // Sort all of the items
 
 
-//Header: XP3\r\n \x1a\x8b\x67\x01
-static HEADER: [u8; 11] = [
-    0x58, 0x50, 0x33, 0x0d, 0x0a, 0x20, 0x0a, 0x1a,
-    0x8b, 0x67, 0x01,
-];
-
 //If 1, uses zLib compression, if 0 then raw, error if anything else
 const ENCODING_MASK: u8 = 0x07;
 
@@ -111,82 +105,84 @@ const CONTINUE_MASK: u8 = 0x80;
 //The mask to check if an index is protected
 const PROTECTED_MASK: u32 = 1 << 31;
 
-//Splits the given XP3 file if it's the correct format
-//The vector will be empty if no files are written
-pub fn flare<R, P>(stream: &mut ReadStream<R>, folder: &P) -> Vec<String>
- where R: Read + Seek, P: AsRef<Path> {
-    stream.little_endian(true);
-    stream.seek(SeekFrom::Start(0));
+//Magic: XP3\r\n \x1a\x8b\x67\x01
+const HEADER: &'static [u8] = &[ 0x58, 0x50, 0x33, 0x0d, 0x0a, 0x20, 0x0a, 0x1a, 0x8b, 0x67, 0x01 ];
 
-    //Return if we can't find the header
-    let start_offset = match find_start_offset(stream) {
-        Some(x) => x,
-        None => return Vec::new(),
-    };
+pub struct XP3Archive {
 
-    let mut items: Vec<ArchiveItem> = Vec::new();
+}
 
-    loop {
-        let (mut entry_data, entry_flag) = find_entry_data(stream, start_offset);
+impl Converter for XP3Archive {
+    fn is_correct_format<R: Read + Seek>(stream: &mut ReadStream<R>) -> bool {
+        find_start_offset(stream).is_some()
+    }
+
+    fn new() -> XP3Archive {
+        XP3Archive {
+            
+        }
+    }
+
+    fn flare<R: Read + Seek>(&mut self, mut stream: ReadStream<R>, save_folder: &PathBuf) {
+        // If this is called, the stream is the correct format
+        let start_offset = find_start_offset(&mut stream).unwrap();
+
+        let mut items: Vec<ArchiveItem> = Vec::new();
 
         loop {
+            let (mut entry_data, entry_flag) = find_entry_data(&mut stream, start_offset);
+
             //Keep going while we are finding file chunks
-            if let Some(Chunk::File(ref mut file_data)) = find_chunk(&mut entry_data) {
+            while let Some(Chunk::File(ref mut file_data)) = find_chunk(&mut entry_data) {
                 items.push(ArchiveItem::new(file_data, start_offset));
-            } else {
+            }
+
+            if entry_flag & CONTINUE_MASK == 0 {
                 break;
             }
         }
 
-        if entry_flag & CONTINUE_MASK == 0 {
-			break;
-        }
-    }
+        items.sort();
 
-    items.sort();
-    println!("Completed an archive with {} files", items.len());
+        //Write all of the files from the items
+        for item in items {
+            let mut path = save_folder.clone();
+            path.push(item.name);
 
-    let mut files: Vec<String> = Vec::new();
-    //Write all of the files from the items
-    for i in items {
-        let mut path = PathBuf::new();
-        path.push(folder);
-        path.push(i.name);
+            let mut file = file_utils::make_file(&path);
+            for segment in item.segments {
+                stream.seek(SeekFrom::Start(segment.start)).unwrap();
+                let buffer = if segment.compressed {
+                    let compressed = stream.read_exact(segment.archive_size as usize).unwrap();
 
-        let mut file = file_utils::make_file(&path);
-        for j in i.segments {
-            let mut buffer: Vec<u8> = vec![0; j.original_size as usize];
-            stream.seek(SeekFrom::Start(j.start));
+                    let mut decompressor = ZlibDecoder::new(Vec::new());
+                    decompressor.write_all(&compressed).unwrap();
+                    decompressor.finish().unwrap()
+                } else {
+                    stream.read_exact(segment.original_size as usize).unwrap()
+                };
 
-            if j.compressed {
-                let mut compressed = stream.read(j.archive_size as usize).unwrap();
-
-                let mut decompressor = Decompress::new(true);
-                decompressor.decompress(&*compressed, &mut *buffer, Flush::Finish);
-            } else {
-                stream.read_into(&mut buffer).unwrap();
+                //Unencrypt the buffer
+                // for byte in buffer.iter_mut() {
+                //     *byte ^= i.file_hash as u8;
+                // }
+                // Seek to the offset specified in the file before we start writing
+                file.seek(SeekFrom::Start(segment.offset)).unwrap();
+                file.write_all(&buffer).unwrap();
             }
-
-            //Unencrypt the buffer
-            // for byte in buffer.iter_mut() {
-            //     *byte ^= i.file_hash as u8;
-            // }
-            file.seek(SeekFrom::Start(j.offset));
-            file.write(&buffer);
         }
-
-        files.push(format!("XP3 Archive: {:?}", path));
     }
-
-    files
 }
 
 ///Finds the start of the XP3 Archive and returns the offset
 ///An XP3 archive can be after a Win32 exe container in the same file
-fn find_start_offset<R>(stream: &mut ReadStream<R>) -> Option<u64>
- where R: Read + Seek {
+fn find_start_offset<R: Read + Seek>(stream: &mut ReadStream<R>) -> Option<u64> {
+    // Make sure that the stream is set correctly
+    stream.little_endian(true);
+    stream.seek(SeekFrom::Start(0)).unwrap();
+
     //Try to read the header right from the start
-    let mut header_buffer = match stream.read(11) {
+    let mut header_buffer = match stream.read_exact(11) {
         Ok(x) => x,
         Err(_) => return None,
     };
@@ -197,14 +193,14 @@ fn find_start_offset<R>(stream: &mut ReadStream<R>) -> Option<u64>
     //The header must start on a 16 byte boundary
     if header_buffer[0] == 0x4d && header_buffer[1] == 0x5a {
         //Seek to an even 16 byte boundary
-        stream.seek(SeekFrom::Current(5));
+        stream.seek(SeekFrom::Current(5)).unwrap();
         let mut offset = 16_u64;
         while let Ok(_) = stream.read_into(&mut header_buffer) {
             if header_buffer == HEADER {
                 return Some(offset);
             }
             offset += 16;
-            stream.seek(SeekFrom::Current(5));
+            stream.seek(SeekFrom::Current(5)).unwrap();
         }
 
         //If we got this far, it means we went through the entire file and couldn't find the header
@@ -218,44 +214,43 @@ fn find_start_offset<R>(stream: &mut ReadStream<R>) -> Option<u64>
 
 ///Finds and returns the next entry data with the associated entry flag
 ///This function assumes that the stream is at the start of an entry
-fn find_entry_data<R>(stream: &mut ReadStream<R>, start_offset: u64)
- -> (InMemoryStream, u8)
- where R: Read + Seek {
+fn find_entry_data<R: Read + Seek>(stream: &mut ReadStream<R>, start_offset: u64)
+-> (InMemoryStream, u8) {
     //The entry offset may be required to overflow if the header is not at the beginning of a file
-    let entry_offset = stream.read_u64().unwrap().wrapping_add(start_offset);
-    stream.seek(SeekFrom::Start(entry_offset));
+    let entry_offset = stream.read::<u64>().unwrap().wrapping_add(start_offset);
+    stream.seek(SeekFrom::Start(entry_offset)).unwrap();
 
-    let mut entry_data: Vec<u8>;
+    let entry_flag = stream.read::<u8>().unwrap();
+    let entry_data = if entry_flag & ENCODING_MASK == 1 {
+        let enc_size = stream.read::<u64>().unwrap();
+        let real_size = stream.read::<u64>().unwrap();
 
-    let entry_flag = stream.read_u8().unwrap();
-    if entry_flag & ENCODING_MASK == 1 {
-        let enc_size = stream.read_u64().unwrap();
-        let real_size = stream.read_u64().unwrap();
-        
-        entry_data = vec![0; real_size as usize];
-        let compressed = stream.read(enc_size as usize).unwrap();
+        let compressed = stream.read_exact(enc_size as usize).unwrap();
 
-        let mut decompressor = Decompress::new(true);
-        decompressor.decompress(&*compressed, &mut *entry_data, Flush::Finish);
+        let mut decompressor = ZlibDecoder::new(Vec::new());
+        decompressor.write_all(&compressed).unwrap();
+        let entry_data = decompressor.finish().unwrap();
+
+        debug_assert_eq!(entry_data.len(), real_size as usize);
+        entry_data
     } else if entry_flag & ENCODING_MASK == 0 {
-        let index_size = stream.read_u64().unwrap();
-        entry_data = stream.read(index_size as usize).unwrap();
+        let index_size = stream.read::<u64>().unwrap();
+        stream.read_exact(index_size as usize).unwrap()
     } else {
         panic!("Bad flag in entry at 0x{:x}", entry_offset);
-    }
+    };
 
     (ReadStream::new(Cursor::new(entry_data), true), entry_flag)
 }
 
 ///Returns the next chunk type with the stream positioned to start reading its data
-fn find_chunk<R>(stream: &mut ReadStream<R>) -> Option<Chunk>
- where R: Read + Seek {
+fn find_chunk<R: Read + Seek>(stream: &mut ReadStream<R>) -> Option<Chunk> {
     //Read the name of the chunk
-    let name = match stream.read(4) {
+    let name = match stream.read_exact(4) {
         Ok(x) => x,
         Err(_) => return None,
     };
-    let real_size = match stream.read_u64() {
+    let real_size = match stream.read::<u64>() {
         Ok(x) => x,
         Err(_) => return None,
     };
@@ -274,8 +269,7 @@ struct ArchiveItem {
 }
 
 impl ArchiveItem {
-    fn new<R>(file_data: &mut ReadStream<R>, start_offset: u64) -> ArchiveItem
-     where R: Read + Seek {
+    fn new<R: Read + Seek>(file_data: &mut ReadStream<R>, start_offset: u64) -> ArchiveItem {
         let mut item = ArchiveItem {
             name: String::new(),
             file_hash: 0,
@@ -285,7 +279,7 @@ impl ArchiveItem {
         };
         
         //We have a max of 3 sub-chunks that can be found
-        for i in 0..3 {
+        for _ in 0..3 {
             if let Some(mut chunk) = find_chunk(file_data) {
                 match chunk {
                     Chunk::Info(ref mut info_data) => {
@@ -300,7 +294,7 @@ impl ArchiveItem {
                         item.segments.sort();
                     },
                     Chunk::Adlr(ref mut adlr_data) => {
-                        item.file_hash = adlr_data.read_u32().unwrap();
+                        item.file_hash = adlr_data.read::<u32>().unwrap();
                     },
                     Chunk::File(_) => panic!("A file chunk cannot be within another file chunk"),
                 }
@@ -315,17 +309,17 @@ impl ArchiveItem {
 
     fn read_info<R>(&mut self, info_data: &mut ReadStream<R>)
      where R: Read + Seek {
-        let item_flags = info_data.read_u32().unwrap();
+        let item_flags = info_data.read::<u32>().unwrap();
         if item_flags & PROTECTED_MASK == 1 {
             eprintln!("The current index is protected");
         }
 
-        self.original_size = info_data.read_u64().unwrap();
-        self.archive_size = info_data.read_u64().unwrap();
+        self.original_size = info_data.read::<u64>().unwrap();
+        self.archive_size = info_data.read::<u64>().unwrap();
 
         //Read the UTF-16 name
-        let utf16_len = info_data.read_u16().unwrap();
-        self.name = info_data.read_utf16(utf16_len as usize).unwrap();
+        let utf16_len = info_data.read::<u16>().unwrap();
+        self.name = info_data.read_with_len::<UTF16LE>(utf16_len as usize).unwrap();
         //We need to shorten the path name if it's longer than 255 bytes
         if self.name.len() > 255 {
             //Find all of the character boundaries
@@ -390,44 +384,39 @@ struct ArchiveSegment {
 impl ArchiveSegment {
     fn find_all<R>(segm_data: &mut ReadStream<R>, start_offset: u64) -> Vec<ArchiveSegment>
      where R: Read + Seek {
-        let mut segments: Vec<ArchiveSegment> = Vec::new();
-        
         let segm_size = segm_data.len();
         if segm_size % 28 != 0 {
             eprintln!("The segment isn't divisable by 28 bytes");
         }
         let count = segm_size / 28;
         let mut offset_in_archive: u64 = 0;
-        for i in 0..count {
-            let mut seg = ArchiveSegment {
-                start: 0,
-                offset: 0,
-                original_size: 0,
-                archive_size: 0,
-                compressed: true,
-            };
+        (0..count).map(|i| {
+            let flags = segm_data.read::<u32>().unwrap();
 
-            let flags = segm_data.read_u32().unwrap();
-
-            if flags & (ENCODING_MASK as u32) == 1 {
-                seg.compressed = true;
+            // Since the mask is 0b111, other values besides 0 or 1 could possibly appear
+            let compressed = if flags & (ENCODING_MASK as u32) == 1 {
+                true
             } else if flags & (ENCODING_MASK as u32) == 0 {
-                seg.compressed = false;
+                false
             } else {
                 panic!("Bad flag in segment {}", i);
+            };
+
+            let start = segm_data.read::<u64>().unwrap() + start_offset;
+            let offset = offset_in_archive;
+            let original_size = segm_data.read::<u64>().unwrap();
+            let archive_size = segm_data.read::<u64>().unwrap();
+
+            offset_in_archive += original_size;
+
+            ArchiveSegment {
+                start,
+                offset,
+                original_size,
+                archive_size,
+                compressed,
             }
-
-            seg.start = segm_data.read_u64().unwrap() + start_offset;
-            seg.offset = offset_in_archive;
-            seg.original_size = segm_data.read_u64().unwrap();
-            seg.archive_size = segm_data.read_u64().unwrap();
-
-            offset_in_archive += seg.original_size;
-
-            segments.push(seg);
-        }
-
-        segments
+        }).collect()
     }
 }
 
@@ -467,30 +456,28 @@ enum Chunk {
 impl Chunk {
     //Tries to guess the type of the chunk
     fn guess<R>(stream: &mut ReadStream<R>, name: [u8; 4], size: u64) -> Option<Chunk>
-     where R: Read + Seek {
+    where R: Read + Seek {
         //Try to create the stream first as the order for this doesn't matter and doing this first
         // makes the code cleaner
         //If either the name checking or the stream fails, we need to return None, anyway
-        if let Some(x) = create_stream(stream, size) {
-            if name == FILE_CHUNK {
-                return Some(Chunk::File(x));
-            } else if name == INFO_CHUNK {
-                return Some(Chunk::Info(x));
-            } else if name == SEGM_CHUNK {
-                return Some(Chunk::Segment(x));
-            } else if name == ADLR_CHUNK {
-                return Some(Chunk::Adlr(x));
+        if let Some(stream) = create_stream(stream, size) {
+            match name {
+                FILE_CHUNK => Some(Chunk::File(stream)),
+                INFO_CHUNK => Some(Chunk::Info(stream)),
+                SEGM_CHUNK => Some(Chunk::Segment(stream)),
+                ADLR_CHUNK => Some(Chunk::Adlr(stream)),
+                _ => None,
             }
+        } else {
+            None
         }
-        
-        None
     }
 }
 
 ///Creates a stream from the given stream from the next size bytes
 fn create_stream<R>(stream: &mut ReadStream<R>, size: u64) -> Option<InMemoryStream>
- where R: Read + Seek {
-    let buffer = match stream.read(size as usize) {
+where R: Read + Seek {
+    let buffer = match stream.read_exact(size as usize) {
         Ok(x) => x,
         Err(_) => return None,
     };

@@ -1,8 +1,9 @@
 [package]
-name = "binary-flare"
+name = "binaryflare"
 version = "0.1.0"
 authors = ["bence"]
 
 [dependencies]
-time = "^0.1.38"
-flate2 = "^0.2.19"
+flate2 = "1.0.1"
+time = "0.1.39"
+rayon = "1.0.0"
